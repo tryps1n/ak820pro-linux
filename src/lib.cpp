@@ -6,9 +6,19 @@
 #include <chrono>
 #include <ctime>
 #define STB_IMAGE_IMPLEMENTATION
-#include "stb_image.h"
+#include "lib/stb_image.h"
+#define STB_IMAGE_RESIZE_IMPLEMENTATION
+#include "lib/stb_image_resize2.h"
+#include <gif_lib.h>
 
 const int WIDTH = 128, HEIGHT = 128;
+const int OUTPUT_W = 128, OUTPUT_H = 128, NUM_CHANNELS = 3;
+
+struct GifAnimation {
+    uint8_t frame_count = 0;
+    uint8_t delay_cs = 1; // delay in centiseconds (10 = 100ms)
+    std::vector<uint8_t> concatenated_rgb565;
+};
 
 uint16_t rgb888_to_rgb565(uint8_t r, uint8_t g, uint8_t b) {
     uint16_t r5 = (r >> 3) & 0x1F;
@@ -93,57 +103,58 @@ bool upload_image_data(hid_device* ctrl, hid_device* data, const std::vector<uin
     return send_cmd(ctrl, 0x02, 0x00, 0x00);                              // SAVE
 }
 
-void send_time_sync(hid_device* handle) {
-    auto now = std::chrono::system_clock::now();
-    std::time_t now_c = std::chrono::system_clock::to_time_t(now);
-    std::tm* local_time = std::localtime(&now_c);
+bool upload_gif_data(hid_device* ctrl, hid_device* data,
+                       const std::vector<uint8_t>& px,
+                       uint8_t frame_count = 1, uint8_t delay = 0) {
+    constexpr size_t CHUNK = 4096;
+    std::vector<uint8_t> payload(256, 0xFF);
+    payload[0] = frame_count;
+    payload[1] = delay;
+    payload.insert(payload.end(), px.begin(), px.end());
 
-    int year = local_time->tm_year + 1900 - 2000; // e.g., 26 for 2026
-    int month = local_time->tm_mon + 1;
-    int day = local_time->tm_mday;
-    int hour = local_time->tm_hour;
-    int minute = local_time->tm_min;
-    int second = local_time->tm_sec;
+    size_t chunks = (payload.size() + CHUNK - 1) / CHUNK;
+    payload.resize(chunks * CHUNK, 0xFF);
 
-    std::vector<uint8_t> packet(64, 0);
-    packet[0] = 0x00; // report ID
-    packet[1] = 0x12; // command for time sync
+    if (!send_cmd(ctrl, 0x18, 0x00, 0x00)) return false; // START
+    if (!send_cmd(ctrl, 0x72, 0x03, chunks & 0xFF, (chunks >> 8) & 0xFF)) return false;
 
-    packet[2] = static_cast<uint8_t>(year);
-    packet[3] = static_cast<uint8_t>(month);
-    packet[4] = static_cast<uint8_t>(day);
-    packet[5] = static_cast<uint8_t>(hour);
-    packet[6] = static_cast<uint8_t>(minute);
-    packet[7] = static_cast<uint8_t>(second);
-
-    int result = hid_send_feature_report(handle, packet.data(), packet.size());
-    
-    if (result < 0) {
-        std::cerr << "Failed to send data." << std::endl;
+    std::vector<uint8_t> out(CHUNK + 1);
+    for (size_t i = 0; i < chunks; ++i) {
+        out[0] = 0x00;
+        std::copy_n(payload.begin() + i * CHUNK, CHUNK, out.begin() + 1);
+        if (hid_write(data, out.data(), out.size()) < 0) {
+            std::wcerr << L"write: " << hid_error(data) << L"\n";
+            return false;
+        }
+        uint8_t ack[64] = {0};
+        hid_read_timeout(data, ack, 64, 300);
     }
-    else {
-        std::cout << "Time sync command sent successfully." << std::endl;
-    }
-
+    return send_cmd(ctrl, 0x02, 0x00, 0x00); // SAVE
 }
 
 std::vector<uint8_t> load_and_convert_image(const char* filepath) {
-   int width, height, channels;
-   unsigned char* img_data = stbi_load(filepath, &width, &height, &channels, 3);
-    
-    if (!img_data) {
+    int input_width, input_height, input_channels;
+
+    std::vector<unsigned char> img_data(OUTPUT_H * OUTPUT_W * NUM_CHANNELS);
+
+    unsigned char* raw_img = stbi_load(filepath, &input_width, &input_height, &input_channels, 3);
+    unsigned char* res = stbir_resize_uint8_linear(
+            raw_img,  input_width,  input_height,  0, // 0 defaults input stride to input_w * num_channels
+            img_data.data(), OUTPUT_W, OUTPUT_H, 0, // 0 defaults output stride to output_w * num_channels // Tells the pixel layout helper it has an alpha channel to weight properly
+            STBIR_RGB
+        );
+
+    stbi_image_free((void*)raw_img);
+
+    if (!res) {
         std::cerr << "Failed to load image: " << filepath << "\n";
         return {};
     }
     
-    if (width != 128 || height != 128) {
-        std::cout << "Warning: Image is " << width << "x" << height << ". Ideally it should be 128x128 pixels.\n";
-    }
-
     std::vector<uint8_t> rgb565_bytes;
-    rgb565_bytes.reserve(width * height * 2);
+    rgb565_bytes.reserve(OUTPUT_W * OUTPUT_H * 2);
 
-    for (int i = 0; i < width*height; ++i) {
+    for (int i = 0; i < OUTPUT_H*OUTPUT_W; ++i) {
         uint8_t  r = img_data[i*3 + 0];
         uint8_t  g = img_data[i*3 + 1];
         uint8_t  b = img_data[i*3 + 2];
@@ -154,7 +165,144 @@ std::vector<uint8_t> load_and_convert_image(const char* filepath) {
         rgb565_bytes.push_back(conv_pixel & 0xFF);
     }
 
-    stbi_image_free(img_data);
+    // stbi_image_free(img_data);
 
     return rgb565_bytes;
+}
+
+GifAnimation load_gif(const char* filepath) {
+    int error = 0;
+    GifFileType* gif = DGifOpenFileName(filepath, &error);
+    if (!gif) {
+        std::cerr << "Failed to load gif." << std::endl;
+        return {};
+    }
+
+    if (DGifSlurp(gif) == GIF_ERROR) {
+        std::cerr << "Error reading gif data." << std::endl;
+        DGifCloseFile(gif, &error);
+        return {};
+    }
+
+    int rawW = gif->SWidth; 
+    int rawH = gif->SHeight;
+    int frameCount = std::min(gif->ImageCount, 255);
+
+    GifAnimation anim;
+    anim.frame_count = static_cast<uint8_t>(frameCount);
+    anim.concatenated_rgb565.reserve(frameCount * OUTPUT_W * OUTPUT_H * 2);
+
+    std::vector<uint8_t> canvas(rawW * rawH * 3, 0);
+    std::vector<uint8_t> resized(OUTPUT_W * OUTPUT_H * 3);
+
+uint32_t total_delay_cs = 0;
+    int valid_delay_frames = 0;
+
+    for (int f = 0; f < frameCount; ++f) {
+        SavedImage* frame = &gif->SavedImages[f];
+        GifImageDesc& desc = frame->ImageDesc;
+        ColorMapObject* cmap = desc.ColorMap ? desc.ColorMap : gif->SColorMap;
+
+        int transparent_idx = -1;
+        int disposal_mode = 0;
+
+        for (int e = 0; e < frame->ExtensionBlockCount; ++e) {
+            ExtensionBlock& ext = frame->ExtensionBlocks[e];
+            if (ext.Function == GRAPHICS_EXT_FUNC_CODE && ext.ByteCount >= 4) {
+                uint8_t packed = ext.Bytes[0];
+                disposal_mode = (packed >> 2) & 0x07;
+                if (packed & 0x01) {
+                    transparent_idx = static_cast<uint8_t>(ext.Bytes[3]);
+                }
+
+                // Read 16-bit little-endian delay in centiseconds (1/100s)
+                uint16_t frame_delay_cs = static_cast<uint8_t>(ext.Bytes[1]) |
+                                          (static_cast<uint8_t>(ext.Bytes[2]) << 8);
+
+                // Browsers treat 0 or 1 cs as 10 cs (100ms); accumulate valid delays
+                if (frame_delay_cs > 0) {
+                    total_delay_cs += frame_delay_cs;
+                    valid_delay_frames++;
+                }
+            }
+        }
+
+        std::vector<uint8_t> prev_canvas;
+        if (disposal_mode == 3) {
+            prev_canvas = canvas;
+        }
+
+        if (cmap) {
+            for (int y = 0; y < desc.Height; ++y) {
+                int dst_y = desc.Top + y;
+                if (dst_y < 0 || dst_y >= rawH) continue;
+
+                for (int x = 0; x < desc.Width; ++x) {
+                    int dst_x = desc.Left + x;
+                    if (dst_x < 0 || dst_x >= rawW) continue;
+
+                    uint8_t color_idx = frame->RasterBits[y * desc.Width + x];
+                    if (color_idx == transparent_idx || color_idx >= cmap->ColorCount) {
+                        continue;
+                    }
+
+                    GifColorType rgb = cmap->Colors[color_idx];
+                    size_t dst_offset = (dst_y * rawW + dst_x) * 3;
+                    canvas[dst_offset + 0] = rgb.Red;
+                    canvas[dst_offset + 1] = rgb.Green;
+                    canvas[dst_offset + 2] = rgb.Blue;
+                }
+            }
+        }
+
+        stbir_resize_uint8_linear(
+            canvas.data(), rawW, rawH, 0,
+            resized.data(), OUTPUT_W, OUTPUT_H, 0,
+            STBIR_RGB
+        );
+
+        for (int p = 0; p < OUTPUT_W * OUTPUT_H; ++p) {
+            uint8_t r = resized[p * 3 + 0];
+            uint8_t g = resized[p * 3 + 1];
+            uint8_t b = resized[p * 3 + 2];
+
+            uint16_t conv_pixel = rgb888_to_rgb565(r, g, b);
+            anim.concatenated_rgb565.push_back(conv_pixel >> 8);
+            anim.concatenated_rgb565.push_back(conv_pixel & 0xFF);
+        }
+
+        if (disposal_mode == 2) {
+            for (int y = 0; y < desc.Height; ++y) {
+                int dst_y = desc.Top + y;
+                if (dst_y < 0 || dst_y >= rawH) continue;
+                for (int x = 0; x < desc.Width; ++x) {
+                    int dst_x = desc.Left + x;
+                    if (dst_x < 0 || dst_x >= rawW) continue;
+                    size_t dst_offset = (dst_y * rawW + dst_x) * 3;
+                    canvas[dst_offset + 0] = 0;
+                    canvas[dst_offset + 1] = 0;
+                    canvas[dst_offset + 2] = 0;
+                }
+            }
+        } else if (disposal_mode == 3 && !prev_canvas.empty()) {
+            canvas = std::move(prev_canvas);
+        }
+    }
+
+    // Compute average GIF delay in centiseconds (default to 10 cs = 100ms only if GIF specifies 0)
+    int avg_delay_cs = (valid_delay_frames > 0)
+                     ? static_cast<int>(total_delay_cs / valid_delay_frames)
+                     : 10;
+
+    // NOTE: GIF delays are in centiseconds (10ms units).
+    // If your screen expects milliseconds instead of centiseconds, multiply by 10:
+    int device_delay = avg_delay_cs * 10;
+
+    anim.delay_cs = static_cast<uint8_t>(std::clamp(device_delay, 1, 255));
+
+    std::cout << "Detected GIF frame delay: " << avg_delay_cs << " cs ("
+              << (avg_delay_cs * 10) << " ms)\n";
+
+    DGifCloseFile(gif, &error);
+    return anim;
 }

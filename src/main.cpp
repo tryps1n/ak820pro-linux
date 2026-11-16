@@ -1,6 +1,7 @@
 #include <iostream>
+#include <cstring>
 #include <hidapi/hidapi.h>
-#include "stb_image.h"
+#include "lib/stb_image.h"
 #include "lib.cpp"
 
 // 0c45:800a
@@ -8,11 +9,15 @@ constexpr unsigned short VENDOR_ID = 0x0c45;
 constexpr unsigned short PRODUCT_ID = 0x800a;
 
 int main(int argc, char *argv[]) {
-    if (argc < 2) {
+    if (argc < 3 || std::strlen(argv[2]) != 1 || (argv[2][0] != 'i' && argv[2][0] != 'g')) {
         std::cout << "Format:" 
-                  << "  ./main <image_path>" << std::endl;
+                  << "  ./main <src_path> <flag>"
+                  << "  Flags: g -> gif, i -> img" << std::endl;
         return 0;
     }
+
+    char mode = argv[2][0];
+    const char* filepath = argv[1];
 
     if (hid_init() != 0) {
         std::cerr << "Failed to initialise hidapi" << std::endl;
@@ -49,15 +54,34 @@ int main(int argc, char *argv[]) {
         return 3;
     }
 
-    const char* filepath = argv[1];
-    std::vector<uint8_t> pixels = load_and_convert_image(filepath);
-    
-    upload_image_data(devIface3, devIface2, pixels); 
+    bool ok = false;
+    if (mode == 'i') {
+        std::vector<uint8_t> pixels = load_and_convert_image(filepath);
+        if (!pixels.empty()) {
+            ok = upload_image_data(devIface3, devIface2, pixels);
+        }
+    } else if (mode == 'g') {
+        GifAnimation anim = load_gif(filepath);
+        if (anim.frame_count > 0) {
+            std::cout << "Uploading " << static_cast<int>(anim.frame_count)
+                      << " frames (delay: " << static_cast<int>(anim.delay_cs) << ")...\n";
+            ok = upload_gif_data(devIface3, devIface2,
+                                   anim.concatenated_rgb565,
+                                   anim.frame_count,
+                                   anim.delay_cs);
+        }
+    }
+
+    if (ok) {
+        std::cout << "Upload complete.\n";
+    } else {
+        std::cerr << "Upload failed.\n";
+    }
 
     hid_free_enumeration(devs);
     hid_close(devIface2);
     hid_close(devIface3);
     hid_exit();
 
-    return 0;
+    return ok ? 0 : 4;
 }
