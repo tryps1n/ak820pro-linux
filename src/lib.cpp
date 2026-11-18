@@ -60,7 +60,6 @@ void upload_image_header(hid_device *handle, std::vector<uint8_t> frame_bytes) {
     header[11] = (HEIGHT >> 8) & 0xFF;
     header[16] = 0x01; // Single frame count
 
-    // 3. Transmit the 256-byte header in 60-byte chunks
     for (size_t i = 0; i < header.size(); i += 60) {
         uint8_t packet[65] = {0};
         packet[0] = 0x00; // Report ID
@@ -215,11 +214,9 @@ uint32_t total_delay_cs = 0;
                     transparent_idx = static_cast<uint8_t>(ext.Bytes[3]);
                 }
 
-                // Read 16-bit little-endian delay in centiseconds (1/100s)
                 uint16_t frame_delay_cs = static_cast<uint8_t>(ext.Bytes[1]) |
                                           (static_cast<uint8_t>(ext.Bytes[2]) << 8);
 
-                // Browsers treat 0 or 1 cs as 10 cs (100ms); accumulate valid delays
                 if (frame_delay_cs > 0) {
                     total_delay_cs += frame_delay_cs;
                     valid_delay_frames++;
@@ -289,13 +286,10 @@ uint32_t total_delay_cs = 0;
         }
     }
 
-    // Compute average GIF delay in centiseconds (default to 10 cs = 100ms only if GIF specifies 0)
     int avg_delay_cs = (valid_delay_frames > 0)
                      ? static_cast<int>(total_delay_cs / valid_delay_frames)
                      : 10;
 
-    // NOTE: GIF delays are in centiseconds (10ms units).
-    // If your screen expects milliseconds instead of centiseconds, multiply by 10:
     int device_delay = avg_delay_cs * 10;
 
     anim.delay_cs = static_cast<uint8_t>(std::clamp(device_delay, 1, 255));
