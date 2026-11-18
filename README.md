@@ -1,6 +1,6 @@
-# Linux Driver for Ajazz AK820 Pro Keyboard
+# Ajazz AK820 Pro Linux C Driver
 
-A simple C file for controlling and customizing the built-in TFT screen on the **Ajazz AK820 Pro** mechanical keyboard on Linux.
+A simple C file for controlling and customizing the built-in TFT screen on the Ajazz AK820 Pro mechanical keyboard on Linux
 
 ---
 
@@ -27,5 +27,5 @@ Make sure your keyboard is connected via **USB wired mode**, then run the compil
 
 ### Flags
 
-`i` - Image - Upload a static image to the TFT screen 
+`i` - Image - Upload a static image to the TFT screen   
 `g` - GIF - Upload an animated GIF to the TFT screen
